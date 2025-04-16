@@ -1,0 +1,1276 @@
+---
+title: "electric appliance"
+author: "nakatsuka"
+date: "2024-12-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library("ggeffects")
+library(jsonlite)
+library(tidyverse)
+library(data.table)
+library(lubridate)
+library(furrr)
+library(purrr)
+library(patchwork)
+library(dplyr)
+library(table1)
+library(tableone)
+library(broom)
+library(logistf)
+library(readxl)
+library(rqlm)
+library(lsmeans)
+library(lme4)
+library(lmerTest)
+library("datawizard")
+library("marginaleffects")
+library(geepack)
+library(biostat3)
+library(gt)
+library(gtExtras)
+library(pROC)
+library(gam)
+library(mgcv)
+options(knitr.duplicate.label = "allow")
+```
+
+### 電力データについて：特定の4週間を春夏秋冬の各季節で選定（1日当たり95％以上の測定が実施できた期間が4週間のうち90%以上続いた）
+
+```{r, include=FALSE}
+#データを取得
+gc()
+gc()
+
+analysisbase <- bind_rows(readRDS("D:/database1.RDS") %>% 
+                            dplyr::select(house_id:power, summer:seasonflg) %>% 
+                            group_by(house_id, appid, seasonflg) %>% 
+                            mutate(olddate = min(timestamp),
+                                   fromolddate = as.numeric(difftime(timestamp, olddate, units = "days")) + 1,
+                                   city = "CityA") %>% 
+                            ungroup() %>% 
+                            group_by(house_id, timestamp, appid) %>% 
+                            mutate(usetime = row_number(),
+                                   usetime = max(usetime),
+                                   usetime = if_else(usetime>1440, 1440, usetime)), 
+                          
+                          readRDS("D:/database2.RDS") %>% 
+                            dplyr::select(house_id:power, summer:seasonflg) %>% 
+                            group_by(house_id, appid, seasonflg) %>% 
+                            mutate(olddate = min(timestamp),
+                                   fromolddate = as.numeric(difftime(timestamp, olddate, units = "days")) + 1,
+                                   city = "CityC") %>% 
+                            ungroup() %>% 
+                            group_by(house_id, timestamp, appid) %>% 
+                            mutate(usetime = row_number(),
+                                   usetime = max(usetime),
+                                   usetime = if_else(usetime>1440, 1440, usetime)),
+                          
+                          readRDS("D:/database3.RDS") %>% 
+                            mutate(hour = if_else(is.na(time), "00", str_sub(time, start = 1, end = 2)),
+                                   minute = if_else(is.na(time), "00", str_sub(time, start = 4, end = 5)),
+                                   second = if_else(is.na(time), "00", str_sub(time, start = 7, end = 8)),
+                                   appid = as.character(appid)) %>% 
+                            dplyr::select(house_id, timestamp, hour, minute, second, appid, power, summer:seasonflg) %>% 
+                            group_by(house_id, appid, seasonflg) %>% 
+                            mutate(olddate = min(timestamp),
+                                   fromolddate = as.numeric(difftime(timestamp, olddate, units = "days")) + 1,
+                                   city = "CityB") %>% 
+                            ungroup() %>% 
+                            group_by(house_id, timestamp, appid) %>% 
+                            mutate(usetime = row_number(),
+                                   usetime = max(usetime),
+                                   usetime = if_else(usetime>1440, 1440, usetime))
+                          )
+
+#出力する家電を限定している
+denryokuday <- analysisbase %>% 
+  group_by(house_id, timestamp, appid) %>% 
+  #使用時間、使用電力をまず、「1日当たりの合計」にする
+  mutate(totalpower = sum(power, na.rm = TRUE)) %>% 
+  ungroup() %>% 
+  #1分ごとの数値から、1日ごとの合計値にまとめる
+  distinct(house_id, appid, timestamp, .keep_all = TRUE) %>% 
+  dplyr::select(house_id, appid, timestamp, totalpower, usetime, seasonflg, spring_measure, summer_measure, fall_measure, winter_measure) %>% 
+  arrange(house_id, appid, timestamp) %>% 
+  #季節ごとの1日当たりの平均値を求める
+  group_by(house_id, appid, seasonflg) %>% 
+  #まず、季節ごとの合計を取得
+  mutate(totalpower_s = sum(totalpower),
+         totaltime_s = sum(usetime)) %>%
+  ungroup() %>% 
+  #測定できた日付で割ることで、季節ごとの「1日当たりの合計」の平均を割り出せる
+  mutate(usetime = case_when(seasonflg=="spring" ~ totaltime_s/spring_measure,
+                             seasonflg=="summer" ~ totaltime_s/summer_measure,
+                             seasonflg=="fall" ~ totaltime_s/fall_measure,
+                             seasonflg=="winter" ~ totaltime_s/winter_measure),
+         meanpower = case_when(seasonflg=="spring" ~ totalpower_s/spring_measure,
+                               seasonflg=="summer" ~ totalpower_s/summer_measure,
+                               seasonflg=="fall" ~ totalpower_s/fall_measure,
+                               seasonflg=="winter" ~ totalpower_s/winter_measure),
+         季節 = case_when(seasonflg=="spring" ~ "春", seasonflg=="summer" ~ "夏",
+                          seasonflg=="fall" ~ "秋", seasonflg=="winter" ~ "冬"),
+         家電 = case_when(appid=="2" ~ "エアコン", appid=="5" ~ "洗濯機", 
+                          appid=="20" ~ "レンジ", appid=="24" ~ "冷蔵庫", 
+                          appid=="31" ~ "掃除機", appid=="37" ~ "IH",
+                          appid=="25" ~ "炊飯器", appid=="30" ~ "テレビ", 
+                          appid=="301" ~ "ヒーター")) %>% 
+  dplyr::select(house_id, 家電, 季節, meanpower, usetime, spring_measure:winter_measure) %>% 
+  #1家庭、1家電、1季節あたりに1行になるように重複を除く（9家電、4季節なので、1家庭当たり最大36行）
+  distinct(house_id, 家電, 季節, meanpower, usetime, .keep_all = TRUE) %>% 
+  filter(!(is.na(家電)))  %>% 
+  pivot_wider(names_from = c("家電", "季節"), values_from = c("meanpower", "usetime")) %>% 
+  mutate(across(c(meanpower_エアコン_夏:usetime_エアコン_春), ~ replace_na(.x, 0)),
+         spring_damy = if_else(is.na(spring_measure), 0, spring_measure),
+         summer_damy = if_else(is.na(summer_measure), 0, summer_measure),
+         fall_damy = if_else(is.na(fall_measure), 0, fall_measure),
+         winter_damy = if_else(is.na(winter_measure), 0, winter_measure),
+         レンジ_1年 = ((usetime_レンジ_春*spring_damy) + (usetime_レンジ_夏*summer_damy) + 
+           (usetime_レンジ_秋*fall_damy) + (usetime_レンジ_冬*winter_damy))/
+           (spring_damy + summer_damy + fall_damy + winter_damy),
+         炊飯器_1年 = ((usetime_炊飯器_春*spring_damy) + (usetime_炊飯器_夏*summer_damy) + 
+           (usetime_炊飯器_秋*fall_damy) + (usetime_炊飯器_冬*winter_damy))/
+           (spring_damy + summer_damy + fall_damy + winter_damy),
+         テレビ_1年 = ((usetime_テレビ_春*spring_damy) + (usetime_テレビ_夏*summer_damy) + 
+           (usetime_テレビ_秋*fall_damy) + (usetime_テレビ_冬*winter_damy))/
+           (spring_damy + summer_damy + fall_damy + winter_damy),
+         洗濯機_1年 = ((usetime_洗濯機_春*spring_damy) + (usetime_洗濯機_夏*summer_damy) + 
+           (usetime_洗濯機_秋*fall_damy) + (usetime_洗濯機_冬*winter_damy))/
+           (spring_damy + summer_damy + fall_damy + winter_damy)) 
+
+
+```
+
+```{r, include=FALSE}
+#使用するデータ
+B_p <- read_csv("D:/questionnaire_B.csv", locale = locale(encoding = "cp932")) %>% 
+  mutate(ID_base = as.character(str_sub(paste0("0000", ID), start = -5, end = -1)),
+         questionnaire_flg = 1,
+         female = if_else(性別==2, 1, 0)) %>% 
+  dplyr::select(ID_base, female, questionnaire_flg) %>% 
+  left_join(read_excel("D:/atena.xlsx") %>% 
+              mutate(ID_base = as.character(str_sub(paste0("0000", ID), start = -5, end = -1)),
+                     atena = as.character(str_sub(paste0("00000000000", `住基CD(最終)`), start = -11, end = -1)),
+                     atena_flg = 1) %>% 
+              dplyr::select(ID_base, atena, atena_flg),
+            by="ID_base") %>% 
+  left_join(read_csv("D:/questionnaire_b_2.csv", locale = locale(encoding = "cp932")) %>% 
+              filter(!(is.na(GDS_1))) %>% 
+              mutate(ID_base = as.character(str_sub(paste0("0000", 被験者ID), start = -5, end = -1)),
+                     tel_flg = 1) %>% 
+              distinct(ID_base, .keep_all = TRUE) %>% 
+              dplyr::select(ID_base, tel_flg),
+            by="ID_base") %>% 
+  left_join(read_excel("D:/atena2.xlsx") %>% 
+              mutate(atena = as.character(str_sub(paste0("00000000000", 宛名番号), start = -11, end = -1)),
+                     house_id = as.character(NOBE番号),
+                     female = if_else(性別=="女", 1, 0)) %>% 
+              dplyr::select(atena, female, house_id),
+            by=c("atena", "female")) %>% 
+  mutate(house_id = as.character(house_id)) %>% 
+  distinct()
+```
+
+```{r, include=FALSE}
+#フレイルの有無、ロコモの有無で分ける
+questionnaire <- fread("D:/questionnaire_A.csv", encoding = "UTF-8")
+
+questionnaire2 <- fread("D:/questionnaire_c.csv", encoding = "UTF-8")
+
+questionnaire3 <- read_csv("questionnaire_B.csv", locale = locale(encoding = "cp932")) %>% 
+  rename_with(\(x) str_replace(x, "問２_", "kihonCL"),
+              c(問２_1:問２_25)) %>% 
+  #下の処理の文言に合わせる
+  mutate(ID_base = as.character(str_sub(paste0("0000", ID), start = -5, end = -1)),
+         across(c(kihonCL1:kihonCL8, kihonCL16, kihonCL19), ~ case_when(.x==2 ~ 1, .x==1 ~ 0)),
+         across(c(kihonCL9:kihonCL11, kihonCL13:kihonCL15, kihonCL17:kihonCL18, kihonCL20:kihonCL25), ~ case_when(.x==1 ~ 1, .x==2 ~ 0)),
+         kihonCL12height = as.numeric(`kihonCL12_身長`),
+         kihonCL12weight = as.numeric(`kihonCL12_体重`),
+         kihonCL12bmi = kihonCL12weight/(kihonCL12height*kihonCL12height/10000),
+         kihonCL12 = if_else(kihonCL12bmi<=18.5, 1, 0)) %>% 
+  inner_join(B_p %>% filter(!(is.na(house_id))),
+             by="ID_base")
+
+kihonCL <- questionnaire %>% 
+  dplyr::select(ID, KCL_1:KCL_35, ロコモチェック_1:ロコモチェック_7, ロコモ検診25_24, `5.身長`, `6.体重`) %>% 
+  mutate(across(c(KCL_1, KCL_2:KCL_4, KCL_5:KCL_12, KCL_13:KCL_35, ロコモチェック_1:ロコモチェック_7, ロコモ検診25_24), ~ as.numeric(.x))) %>% 
+  bind_rows(questionnaire2 %>% 
+              dplyr::select(ID, KCL_1:KCL_35, ロコモチェック_1:ロコモチェック_7, ロコモ検診25_24) %>% 
+            　mutate(across(c(KCL_1, KCL_2:KCL_4, KCL_5:KCL_12, KCL_13:KCL_35, ロコモチェック_1:ロコモチェック_7, ロコモ検診25_24), ~ as.numeric(.x)))) %>% 
+  #項目を基本チェックリストに替える
+  mutate(kihonCL1 = if_else(KCL_21==2, 1, 0),
+         kihonCL2 = if_else(KCL_22==2, 1, 0),
+         kihonCL3 = if_else(KCL_23==2, 1, 0),
+         kihonCL4 = if_else(KCL_24==2, 1, 0),
+         kihonCL5 = if_else(KCL_25==2, 1, 0),
+         kihonCL6 = if_else(ロコモチェック_3==1, 1, 0),
+         kihonCL7 = if_else(KCL_8==2, 1, 0),
+         kihonCL8 = if_else(ロコモチェック_6==1, 1, 0),
+         kihonCL9 = if_else(KCL_10==0, 0, 1),
+         kihonCL10 = if_else(ロコモ検診25_24==1, 0, 1),
+         kihonCL11 = if_else(KCL_11==1, 1, 0),
+         kihonCL12height = as.numeric(`5.身長`),
+         kihonCL12weight = as.numeric(`6.体重`),
+         kihonCL12bmi = kihonCL12weight/(kihonCL12height*kihonCL12height/10000),
+         kihonCL12 = if_else(kihonCL12bmi<=18.5, 1, 0),
+         kihonCL13 = if_else(KCL_13==1, 1, 0),
+         kihonCL14 = if_else(KCL_14==1, 1, 0),
+         kihonCL15 = if_else(KCL_15==1, 1, 0),
+         kihonCL16 = if_else(KCL_19==2, 1, 0),
+         kihonCL17 = if_else(KCL_20==1, 1, 0),
+         kihonCL18 = if_else(KCL_28==1, 1, 0),
+         kihonCL19 = if_else(KCL_27==2, 1, 0),
+         kihonCL20 = if_else(KCL_29==1, 1, 0),
+         kihonCL21 = if_else(KCL_31==1, 1, 0),
+         kihonCL22 = if_else(KCL_32==1, 1, 0),
+         kihonCL23 = if_else(KCL_33==1, 1, 0),
+         kihonCL24 = if_else(KCL_34==1, 1, 0),
+         kihonCL25 = if_else(KCL_35==1, 1, 0)) %>% 
+  bind_rows(questionnaire3 %>% dplyr::select(ID = house_id, kihonCL1:kihonCL11, kihonCL12height:kihonCL12, kihonCL13:kihonCL25)) %>% 
+  mutate(totalscore = kihonCL1 + kihonCL2 + kihonCL3 + kihonCL4 + kihonCL5 + kihonCL6 + kihonCL7 + kihonCL8 + kihonCL9 + kihonCL10 + kihonCL11 + 
+                       kihonCL12 + kihonCL13 + kihonCL14 + kihonCL15 + kihonCL16 + kihonCL17 + kihonCL18 + kihonCL19 + kihonCL20 + 
+           　　　　　　kihonCL21 + kihonCL22 + kihonCL23 + kihonCL24 + kihonCL25,
+         subtotal = kihonCL1 + kihonCL2 + kihonCL3 + kihonCL4 + kihonCL5 + kihonCL6 + kihonCL7 + kihonCL8 + kihonCL9 + kihonCL10 + kihonCL11 + 
+                       kihonCL12 + kihonCL13 + kihonCL14 + kihonCL15 + kihonCL16 + kihonCL17 + kihonCL18 + kihonCL19 + kihonCL20,
+         kinescore = kihonCL6 + kihonCL7 + kihonCL8 + kihonCL9 + kihonCL10,
+         nutriscore = kihonCL11 + kihonCL12,
+         oralscore = kihonCL13 + kihonCL14 + kihonCL15,
+         frail_total = if_else(totalscore>=8, 1, 0),
+         frail_subtotal = if_else(subtotal>=7, 1, 0),
+         frail_kine = if_else(kinescore>=3, 1, 0),
+         frail_nutri = if_else(nutriscore>=2, 1, 0),
+         frail_oral = if_else(oralscore>=2, 1, 0),
+         frailall = if_else(frail_total==1 | frail_kine==1 | frail_nutri==1 | frail_oral==1, 1, 0),
+         frailphenotype = if_else(frail_total==1 | frail_kine==1, 1, 0)) %>% 
+  dplyr::select(ID, kihonCL1:frailphenotype)
+
+#ロコモ
+locomo <- questionnaire %>% 
+  dplyr::select(ID, ロコモ検診25_1:ロコモ検診25_25) %>% 
+  mutate(across(c(ロコモ検診25_1:ロコモ検診25_25), ~ as.numeric(.x))) %>% 
+  bind_rows(questionnaire2 %>% 
+              dplyr::select(ID, ロコモ検診25_1:ロコモ検診25_25) %>% 
+              mutate(across(c(ロコモ検診25_1:ロコモ検診25_25), ~ as.numeric(.x)))) %>% 
+  mutate(across(c(ロコモ検診25_1:ロコモ検診25_25), ~ .x-1),
+         locomo25 = ロコモ検診25_1 + ロコモ検診25_2 + ロコモ検診25_3 + ロコモ検診25_4 + ロコモ検診25_5 + ロコモ検診25_6 + ロコモ検診25_7 + ロコモ検診25_8 +
+                    ロコモ検診25_9 + ロコモ検診25_10 + ロコモ検診25_11 + ロコモ検診25_12 + ロコモ検診25_13 + ロコモ検診25_14 + ロコモ検診25_15 + ロコモ検診25_16 +
+                    ロコモ検診25_17 + ロコモ検診25_18 + ロコモ検診25_19 + ロコモ検診25_20 + ロコモ検診25_21 + ロコモ検診25_22 + ロコモ検診25_23 + ロコモ検診25_24 +
+                    ロコモ検診25_25,
+         locomo25c = case_when(locomo25<7 ~ "locomo_0",
+                               locomo25<16 ~ "locomo_1",
+                               locomo25<24 ~ "locomo_2",
+                               locomo25>=24 ~ "locomo_3") %>% 
+           factor(c("locomo_0", "locomo_1", "locomo_2", "locomo_3"), levels=c("locomo_0", "locomo_1", "locomo_2", "locomo_3")))
+
+lack <- readRDS("D:/lack_of_GDS.RDS")
+
+#うつ
+gds <- questionnaire %>% 
+  dplyr::select(ID, GDS15_1:GDS15_15) %>% 
+  mutate(across(c(GDS15_1:GDS15_15), ~ as.numeric(.x))) %>% 
+  bind_rows(questionnaire2 %>% 
+              dplyr::select(ID, GDS15_1:GDS15_15) %>% 
+              mutate(across(c(GDS15_1:GDS15_15), ~ as.numeric(.x)))) %>% 
+  mutate(across(c(GDS15_1, GDS15_5, GDS15_7, GDS15_11, GDS15_13), ~ if_else(.x==1, 0, 1)),
+         across(c(GDS15_2:GDS15_4, GDS15_6, GDS15_8:GDS15_10, GDS15_12, GDS15_14, GDS15_15), ~ if_else(.x==1, 1, 0)),
+         GDS_score = GDS15_1 + GDS15_2 + GDS15_3 + GDS15_4 + GDS15_5 + GDS15_6 + GDS15_7 + GDS15_8 + GDS15_9 + 
+                     GDS15_10 + GDS15_11 + GDS15_12 + GDS15_13 + GDS15_14 + GDS15_15,
+         GDS = case_when(GDS_score<5 ~ "うつ傾向なし", GDS_score<10 ~ "うつ傾向", GDS_score>=10 ~ "うつ状態"),
+         
+         #ここから目視(事前に欠損した人をピックアップ)
+         #最終的に５点以上かどうかなので、１つ程度の欠損の場合、少なくとも５点以上かどうかを欠損がない部分だけで判断
+         GDS = case_when(is.na(GDS) & ID!="IDA5" &  ID!="IDA25" & ID!="IDA34" ~ "うつ傾向なし",
+                         TRUE ~ GDS) %>% 
+           factor(c("うつ傾向なし", "うつ傾向", "うつ状態"), levels = c("うつ傾向なし", "うつ傾向", "うつ状態")))
+
+
+#電話調査は電力を測定した人すべて受けていた
+GDS_B <- read_csv("D:/questionnaire_B_2.csv", locale = locale(encoding = "cp932")) %>% 
+  mutate(ID_base = as.character(str_sub(paste0("0000", 被験者ID), start = -5, end = -1)),
+         across(c(GDS_1, GDS_5, GDS_7, GDS_11, GDS_13), ~ case_when(.x=="いいえ" ~ 1, .x=="はい" ~ 0)),
+         across(c(GDS_2:GDS_4, GDS_6, GDS_8:GDS_10, GDS_12, GDS_14, GDS_15), ~ case_when(.x=="はい" ~ 1, .x=="いいえ" ~ 0)),
+         GDS_score = GDS_1 + GDS_2 + GDS_3 + GDS_4 + GDS_5 + GDS_6 + GDS_7 + GDS_8 + GDS_9 + 
+                     GDS_10 + GDS_11 + GDS_12 + GDS_13 + GDS_14 + GDS_15,
+         GDS = case_when(GDS_score<5 ~ "うつ傾向なし", GDS_score<10 ~ "うつ傾向", GDS_score>=10 ~ "うつ状態") %>% 
+           factor(c("うつ傾向なし", "うつ傾向", "うつ状態"), levels = c("うつ傾向なし", "うつ傾向", "うつ状態"))) %>% 
+  inner_join(B_p %>% filter(!(is.na(house_id))), by="ID_base")
+
+GDSdata <- gds %>%
+  dplyr::select(ID, GDS_score, GDS, GDS15_9) %>% 
+  bind_rows(GDS_B %>%
+              dplyr::select(ID=house_id, GDS_score, GDS, GDS15_9 = GDS_9) %>% 
+              mutate(ID = as.character(ID)))
+
+#その他プロファイルデータについても整理する ここはまだ1209
+profile <- questionnaire %>% 
+  dplyr::select(ID, age = `4.年齢`, sex = `2.性別`, education = `12.最終学歴`, educationyear = 学歴年数, marriage = `13.婚姻`,
+                working = `17.仕事`, kaigo = `16.介護度`, 睡眠時間 = KCL_18, 運動習慣 = KCL_4,
+                運動習慣頻度 = KCL_5, 運動習慣時間 = KCL_6) %>% 
+  mutate(age = as.numeric(age)-1) %>% #年齢が2024-02-19時点なので、2023-02-19時点に直す
+  bind_rows(questionnaire2 %>% 
+              dplyr::select(ID, 生年月日, sex = `性別`, education = `6.最終学歴`, educationyear = 年数, marriage = `7.婚姻`,
+                     working = `11.仕事`, kaigo = `10.介護度`, 睡眠時間 = KCL_18, 運動習慣 = KCL_4,
+                     運動習慣頻度 = KCL_5, 運動習慣時間 = KCL_6) %>% 
+              mutate(age = interval(start = ymd(生年月日), end = ymd("2023-02-19")),
+                     age = trunc(as.numeric(time_length(age, unit = "year"))),
+                     sex = str_sub(sex, start = 1, end = 1),
+                     across(c(marriage, working, kaigo), ~ as.character(.x))) %>% #年齢は上記と同じ、2023-02-19時点とする
+              dplyr::select(ID, age, sex, education, educationyear, marriage, working, kaigo, 睡眠時間)) %>% 
+  bind_rows(questionnaire3 %>% 
+              mutate(sex = if_else(性別==2, "女", "男"),
+                     問７ = as.character(問７)) %>% 
+              dplyr::select(house_id, age, sex, educationyear = 問７, 問６) %>% 
+              rename(ID = house_id)) %>% 
+  mutate(educationyear = case_when(educationyear!="-" ~ as.numeric(educationyear),
+                                   educationyear=="-" & education=="1" ~ 6,
+                                   educationyear=="-" & education=="2" ~ 9,
+                                   educationyear=="-" & education=="3" ~ 12,
+                                   educationyear=="-" & education=="4" ~ 14,
+                                   educationyear=="-" & education=="5" ~ 14,
+                                   educationyear=="-" & education=="6" ~ 16,
+                                   educationyear=="-" & education=="7" ~ 18,
+                                   TRUE ~ as.numeric(educationyear)),
+         educationcate = case_when(education=="1" | education=="2" ~ "中卒", educationyear<=11 ~ "中卒",
+                                   (education=="3" | education=="4" | education=="5")~ "高卒以上", 
+                                   (educationyear>=12 & educationyear<=15) ~ "高卒以上",
+                                   (education=="6" | education=="7") ~ "大学_専門4年_以上", (educationyear>=16) ~ "大学_専門4年_以上") %>% 
+           factor(c("中卒", "高卒以上", "大学_専門4年_以上"),
+                  levels = c("中卒", "高卒以上", "大学_専門4年_以上")),
+         marriage = case_when(marriage==1 ~ "既婚", marriage==2 ~ "死別", marriage==3 ~ "離別",
+                               marriage==4 ~ "別居", marriage==5 ~ "未婚", TRUE ~ "unknown"),
+         totaly_alone = if_else(marriage=="未婚", 1, 0),
+         working = if_else(working==1, "はい", "いいえ") %>% 
+           factor(c("はい", "いいえ"), levels=c("はい", "いいえ")),
+         運動習慣 = if_else(運動習慣==1, "あり", "なし") %>% 
+           factor(c("あり", "なし"), levels=c("あり", "なし")),
+         kaigo = case_when(kaigo==1 ~ "受けていない",
+                           kaigo==2 ~ "要支援1",
+                           kaigo==3 ~ "要支援2",
+                           kaigo==4 ~ "わからない"),
+         睡眠時間 = case_when(as.numeric(睡眠時間)==1 ~ "６時間未満", as.numeric(睡眠時間)==2 ~ "６～８時間", 
+                          as.numeric(睡眠時間)==3 ~ "８時間以上") %>% 
+           factor(c("６時間未満", "６～８時間", "８時間以上"), levels = c("６時間未満", "６～８時間", "８時間以上")),
+         運動習慣頻度 = case_when(運動習慣頻度==1 ~ "週3~4", 運動習慣頻度==2 ~ "週1~2", 
+                                  運動習慣頻度==3 | 運動習慣頻度==4 ~ "ほぼなし") %>% 
+           factor(c("週3~4", "週1~2", "ほぼなし"), levels = c("週3~4", "週1~2", "ほぼなし")),
+         運動習慣週１以上 = if_else(運動習慣頻度=="ほぼなし", "なし", "あり")) %>% 
+  left_join(kihonCL, by="ID") %>% 
+  left_join(locomo, by="ID") %>% 
+  left_join(GDSdata, by="ID")
+
+```
+
+```{r, echo=FALSE}
+analysis1 <- profile %>% 
+  rename(house_id = ID) %>% 
+  mutate(house_id = as.character(house_id)) %>% 
+  filter(grepl("IDA", house_id) | grepl("IDB", house_id)) %>% 
+  inner_join(denryokuday %>% 
+              mutate(house_id = as.character(house_id)),
+            by="house_id") %>% 
+  rename(年齢 = age, 性別 = sex, 身長 = kihonCL12height, 体重 = kihonCL12weight, BMI = kihonCL12bmi,
+         教育年数 = educationyear, 教育歴 = educationcate, 婚姻状況 = marriage, 労働 = working, 介護認定 = kaigo,
+         表現型フレイル = frailphenotype, オーラルフレイル = frail_oral, KCL総合フレイル = frail_total, KCLサブトータル = frail_subtotal, 
+         運動機能のフレイル = frail_kine,
+         合計測定日_春 = spring_measure, 合計測定日_夏 = summer_measure, 合計測定日_秋 = fall_measure, 合計測定日_冬 = winter_measure, 
+         ロコモ度 = locomo25c) %>% 
+  mutate(springflg = if_else(is.na(合計測定日_春), 0, 1),
+         summerflg = if_else(is.na(合計測定日_夏), 0, 1),
+         fallflg = if_else(is.na(合計測定日_秋), 0, 1),
+         winterflg = if_else(is.na(合計測定日_冬), 0, 1),
+         
+         na_1 = if_else(is.na(合計測定日_春), 1, 0),
+         na_2 = if_else(is.na(合計測定日_夏), 1, 0),
+         na_3 = if_else(is.na(合計測定日_秋), 1, 0),
+         na_4 = if_else(is.na(合計測定日_冬), 1, 0),
+         na_total = na_1 + na_2 + na_3 + na_4)
+
+check <- anti_join(profile %>% rename(house_id = ID), analysis1, by="house_id")
+```
+
+## table 1
+### フレイルの基準：基本チェックリスト(1~25番の項目) 
+
+```{r, echo=FALSE}
+#Table1作成
+frailtable <- analysis1 %>% 
+  filter(年齢>=65) %>% 
+  filter(性別=="男" | 性別=="女") %>% 
+  mutate(KCL総合フレイルc = if_else(KCL総合フレイル==1, "フレイルあり", "フレイルなし"),
+         city = case_when(grepl("IDA", house_id) ~ "CityA", 
+                          grepl("IDC", house_id) ~ "CityC",
+                          grepl("IDB", house_id) ~ "CityB"),
+         city_frail = paste(city, KCL総合フレイルc, sep = "_"),
+         GDS15_5以上 = if_else(GDS_score<=4, "0", "1"),
+         睡眠時間6時間以上 = if_else(睡眠時間=="６～８時間" | 睡眠時間=="８時間以上", 1, 0),
+         ヒーター使用01 = if_else(usetime_ヒーター_春>45, 1, 0)) %>% 
+  filter(na_total<=2) %>% 
+  filter(!(is.na(KCL総合フレイル))) %>% 
+  filter(!(is.na(GDS15_5以上)) & !(is.na(教育年数)))
+
+lackflg <- analysis1 %>% 
+  filter(年齢>=65) %>% 
+  filter(性別=="男" | 性別=="女") %>% 
+  mutate(KCL総合フレイルc = if_else(KCL総合フレイル==1, "フレイルあり", "フレイルなし"),
+         city = case_when(grepl("IDA", house_id) ~ "CityA", 
+                          grepl("IDC", house_id) ~ "CityC",
+                          grepl("IDB", house_id) ~ "CityB"),
+         city_frail = paste(city, KCL総合フレイルc, sep = "_"),
+         GDS15_5以上 = if_else(GDS_score<=4, "0", "1"),
+         睡眠時間6時間以上 = if_else(睡眠時間=="６～８時間" | 睡眠時間=="８時間以上", 1, 0),
+         na_1 = if_else(is.na(合計測定日_春), 1, 0),
+         na_2 = if_else(is.na(合計測定日_夏), 1, 0),
+         na_3 = if_else(is.na(合計測定日_秋), 1, 0),
+         na_4 = if_else(is.na(合計測定日_冬), 1, 0),
+         na_total = na_1 + na_2 + na_3 + na_4,
+         ヒーター使用01 = if_else(usetime_ヒーター_春>45, 1, 0)) %>% 
+  left_join(frailtable %>% 
+              mutate(lack = "analysis group") %>% 
+              dplyr::select(house_id, lack),
+            by="house_id") %>% 
+  mutate(lack = if_else(is.na(lack), "exclude group", lack) %>% 
+           factor(c("exclude group", "analysis group"), levels = c("exclude group", "analysis group"))) %>% 
+  filter(city!="CityC")
+
+analysisp <- frailtable %>% 
+  distinct(house_id)
+
+table(lackflg$問６, lackflg$lack)
+
+table1( ~  年齢 + 性別 + 教育年数 + 教育歴 + GDS + city + totalscore + 身長 + 体重 + 
+          合計測定日_春 + 合計測定日_夏 + 合計測定日_秋 + 合計測定日_冬 | KCL総合フレイルc, data = frailtable, Overall= TRUE,
+        topclass="Rtable1-zebra")
+
+table1( ~  年齢 + 性別 + 教育年数 + 教育歴 + GDS + city + KCL総合フレイルc + totalscore + 身長 + 体重 +
+          合計測定日_春 + 合計測定日_夏 + 合計測定日_秋 + 合計測定日_冬 | lack, data = lackflg, Overall= TRUE,
+        topclass="Rtable1-zebra")
+```
+
+## Figure 1　
+###対象者のフローチャート
+
+```{r, echo=FALSE}
+DiagrammeR::grViz("digraph {
+  graph [layout = dot, rankdir = TB]
+  
+  node [shape = rectangle]        
+  rec1 [label = '対象のうち質問紙に回答し、
+  電力測定を実施した：96']
+  rec2 [label = '65歳以上：89']
+  rec3 [label = '電力のデータ欠損がない：86']
+  rec4 [label = 'フレイルのデータ欠損がない：77']
+  rec5 [label = 'その他交絡変数に欠損がない：71']
+  
+  # ノードIDでエッジを定義
+  rec1 -> rec2 -> rec3 -> rec4 -> rec5
+  }",
+  height = 500)
+
+```
+２シーズン以上の測定ができている場合に欠損無しとした
+
+```{r, echo=FALSE, include=FALSE}
+figuredata <- frailtable %>% 
+  filter(!(is.na(年齢))) %>% 
+  filter(性別=="男" | 性別=="女") %>% 
+  mutate(エアコン春_1hour1point = usetime_エアコン_春/60,
+         エアコン夏_1hour1point = usetime_エアコン_夏/60,
+         エアコン秋_1hour1point = usetime_エアコン_秋/60,
+         エアコン冬_1hour1point = usetime_エアコン_冬/60,
+         テレビ春_1hour1point = usetime_テレビ_春/60,　テレビ夏_1hour1point = usetime_テレビ_夏/60,
+         テレビ秋_1hour1point = usetime_テレビ_秋/60,　テレビ冬_1hour1point = usetime_テレビ_冬/60,
+         レンジ春_1hour1point = usetime_レンジ_春/60,　レンジ夏_1hour1point = usetime_レンジ_夏/60,
+         レンジ秋_1hour1point = usetime_レンジ_秋/60,　レンジ冬_1hour1point = usetime_レンジ_冬/60,
+         洗濯機春_1hour1point = usetime_洗濯機_春/60,  洗濯機夏_1hour1point = usetime_洗濯機_夏/60,
+         洗濯機秋_1hour1point = usetime_洗濯機_秋/60,  洗濯機冬_1hour1point = usetime_洗濯機_冬/60,
+         炊飯器春_1hour1point = usetime_炊飯器_春/60,  炊飯器夏_1hour1point = usetime_炊飯器_夏/60,
+         炊飯器秋_1hour1point = usetime_炊飯器_秋/60,  炊飯器冬_1hour1point = usetime_炊飯器_冬/60,
+         レンジ年_1hour1point = レンジ_1年/60, 炊飯器年_1hour1point = 炊飯器_1年/60,
+         テレビ年_1hour1point = テレビ_1年/60, 洗濯機年_1hour1point = 洗濯機_1年/60,
+         ヒーター春_1hour1point = usetime_ヒーター_春/60,  ヒーター冬_1hour1point = usetime_ヒーター_冬/60,
+         across(c(エアコン春_1hour1point:ヒーター冬_1hour1point), ~ if_else(.x>=24, 24, .x))) %>% 
+  dplyr::select(house_id, frail = KCL総合フレイル,  #ここを変える
+                年齢, 性別, 教育年数, 教育歴, 睡眠時間, GDS15_5以上, GDS15_9, city, springflg:winterflg, エアコン春_1hour1point:ヒーター冬_1hour1point) %>% 
+  pivot_longer(cols = c(エアコン春_1hour1point:ヒーター冬_1hour1point), names_to = "name", values_to = "measure") %>% 
+  mutate(app = str_sub(name, start = 1, end = -14),
+         season = str_sub(name, start = -13, end = -13) %>% factor(c("春", "夏", "秋", "冬", "年"), levels = c("春", "夏", "秋", "冬", "年")),
+         measure = as.numeric(measure)/3) %>% 
+  mutate(教育年数 = if_else(is.na(教育年数), 9, 教育年数),
+         睡眠時間 = if_else(is.na(睡眠時間), "６～８時間", 睡眠時間),
+         GDS15_5以上 = if_else(is.na(GDS15_5以上), "0", GDS15_5以上))
+
+my.render.cont <- function(x, ...) {
+  c('',
+    `Median [IQR]` = sprintf("%s [%s, %s]", round(median(x, na.rm = TRUE),2), round(quantile(x, 0.25, na.rm = TRUE),2), round(quantile(x, 0.75, na.rm = TRUE),2))
+  )
+}
+
+
+table1( ~  テレビ年_1hour1point +
+          エアコン春_1hour1point + エアコン夏_1hour1point + エアコン秋_1hour1point + エアコン冬_1hour1point +
+          洗濯機年_1hour1point + レンジ年_1hour1point + 炊飯器年_1hour1point | frail, 
+        data = figuredata %>% 
+          select(house_id, frail, name, measure) %>% 
+          pivot_wider(names_from = "name", values_from = "measure") %>% 
+          mutate(frail = if_else(frail==1, "フレイルあり", "フレイル無し")), 
+        render = my.render.cont,
+        Overall= TRUE, topclass="Rtable1-zebra")
+
+table1( ~  エアコン春_1hour1point + エアコン夏_1hour1point + エアコン秋_1hour1point + エアコン冬_1hour1point | GDS15_9,
+        data = figuredata %>% 
+          select(house_id, GDS15_9, name, measure) %>% 
+          pivot_wider(names_from = "name", values_from = "measure"), 
+        Overall= TRUE, topclass="Rtable1-zebra")
+
+a <- figuredata %>% 
+          select(house_id, GDS15_9, name, measure) %>% 
+          pivot_wider(names_from = "name", values_from = "measure") %>% filter(GDS15_9==0) %>%  .$エアコン冬_1hour1point
+b <- figuredata %>% 
+          select(house_id, GDS15_9, name, measure) %>% 
+          pivot_wider(names_from = "name", values_from = "measure") %>% filter(GDS15_9==1) %>%  .$エアコン冬_1hour1point
+
+wilcox.test(a, b)
+
+
+#ggeffect
+#エアコン　GDS　Q9
+#crude
+  analysidata <- figuredata %>% 
+    filter(app=="エアコン" & season=="冬") %>% 
+    mutate(n = row_number()) %>% 
+    filter(winterflg==1) %>% 
+    mutate(measure = if_else(is.na(measure), 0, measure*3))
+
+  result <- lm(measure ~ GDS15_9, data = analysidata)
+
+summary(result)
+confint(result)
+
+resulta <- lm(measure ~ GDS15_9 + 年齢 + 性別 + 教育年数 + GDS15_5以上 + city, data = analysidata)
+
+summary(resulta)
+confint(resulta)
+```
+
+```{r, echo=FALSE, include=FALSE}
+season <- c("春", "夏", "秋", "冬")
+
+#ggeffect
+#全体
+#TV
+#crude
+  analysidata <- figuredata %>% 
+    filter(app=="テレビ" & season=="年") %>% 
+    mutate(n = row_number()) %>% 
+    mutate(measure = if_else(is.na(measure), 0, measure))
+
+  result_rr <- geeglm(frail ~ measure,
+                  id = n, data = analysidata, family = poisson(link = "log"), std.err = "san.se")
+
+rr <- exp(coef(result_rr))
+summary <- summary(result_rr)
+se <- summary$coefficients
+keisuu <- coef(result_rr)
+
+rr_table <- data.frame(
+  risk_ratio_crude = rr,
+  CI_low_crude = exp(keisuu - 1.96*(se$Std.err)),
+  CI_high_crude = exp(keisuu + 1.96*(se$Std.err)),
+  pvalue_crude = se$`Pr(>|W|)`
+) %>% 
+  mutate(n = row_number())
+
+result_rr <- geeglm(frail ~ measure + 年齢 + 性別 + 教育年数 + GDS15_5以上 + city,
+                  id = n, data = analysidata, family = poisson(link = "log"), std.err = "san.se")
+
+rr <- exp(coef(result_rr))
+summary <- summary(result_rr)
+se <- summary$coefficients
+keisuu <- coef(result_rr)
+
+rr_table_tv <- left_join(rr_table, data.frame(
+  risk_ratio_adjust = rr,
+  CI_low_adjust = exp(keisuu - 1.96*(se$Std.err)),
+  CI_high_adjust = exp(keisuu + 1.96*(se$Std.err)),
+  pvalue_adjust = se$`Pr(>|W|)`
+) %>% 
+  mutate(n = row_number()),
+by="n") %>% 
+  filter(n==2) %>% 
+  select(-c(n))
+
+```
+
+```{r, echo=FALSE, include=FALSE}
+season <- c("春", "夏", "秋", "冬")
+
+#ggeffect
+#全体
+#エアコン
+#crude
+cruderesults_ac <- map(season, ~ {
+    flg <- case_when(
+    grepl("春", .x) ~ "springflg",
+    grepl("夏", .x) ~ "summerflg",
+    grepl("秋", .x) ~ "fallflg",
+    grepl("冬", .x) ~ "winterflg")
+
+  ac_data <- figuredata %>% 
+    filter(app=="エアコン" & season==.x) %>% 
+    mutate(n = row_number()) %>% 
+    filter(.data[[flg]]==1) %>% 
+    mutate(measure = if_else(is.na(measure), 0, measure))
+  
+  result_rr <- geeglm(frail ~ measure,
+                  id = n, data = ac_data, family = poisson(link = "log"), std.err = "san.se")
+
+rr <- exp(coef(result_rr))
+summary <- summary(result_rr)
+se <- summary$coefficients
+keisuu <- coef(result_rr)
+
+rr_table <- data.frame(
+  risk_ratio = rr,
+  CI_low = exp(keisuu - 1.96*(se$Std.err)),
+  CI_high = exp(keisuu + 1.96*(se$Std.err)),
+  pvalue = se$`Pr(>|W|)`
+)
+
+list(
+  season = .x,
+  acdata = ac_data,
+  result = result_rr,
+  rrtable = rr_table
+)
+
+}
+)
+
+#adjust
+totalresults_ac <- map(season, ~ {
+  flg <- case_when(
+    grepl("春", .x) ~ "springflg",
+    grepl("夏", .x) ~ "summerflg",
+    grepl("秋", .x) ~ "fallflg",
+    grepl("冬", .x) ~ "winterflg")
+  per <- case_when(
+    grepl("春", .x) ~ 0.1,
+    grepl("夏", .x) ~ 0.5,
+    grepl("秋", .x) ~ 0.2,
+    grepl("冬", .x) ~ 0.5)
+  width <- case_when(
+    grepl("春", .x) ~ 2,
+    grepl("夏", .x) ~ 6,
+    grepl("秋", .x) ~ 2,
+    grepl("冬", .x) ~ 6)
+  g_color <- case_when(
+    grepl("春", .x) ~ "hotpink",
+    grepl("夏", .x) ~ "dodgerblue",
+    grepl("秋", .x) ~ "orangered",
+    grepl("冬", .x) ~ "blue")
+  order <- case_when(
+    grepl("春", .x) ~ "a)",
+    grepl("夏", .x) ~ "b)",
+    grepl("秋", .x) ~ "c)",
+    grepl("冬", .x) ~ "d)")
+  height <- case_when(
+    grepl("春", .x) ~ 10,
+    grepl("夏", .x) ~ 2,
+    grepl("秋", .x) ~ 3,
+    grepl("冬", .x) ~ 6)
+  cut_y <- case_when(
+    grepl("春", .x) ~ 6,
+    grepl("夏", .x) ~ 3,
+    grepl("秋", .x) ~ 4,
+    grepl("冬", .x) ~ 7)
+  cut_x <- case_when(
+    grepl("春", .x) ~ 5,
+    grepl("夏", .x) ~ 7,
+    grepl("秋", .x) ~ 5,
+    grepl("冬", .x) ~ 7)
+
+  ac_data <- figuredata %>% 
+    filter(app=="エアコン" & season==.x) %>% 
+    mutate(n = row_number()) %>% 
+    filter(.data[[flg]]==1) %>% 
+    mutate(measure = if_else(is.na(measure), 0, measure))
+  
+  result_rr <- geeglm(frail ~ measure + 年齢 + 性別 + 教育年数 + GDS15_5以上 + city,
+                  id = n, data = ac_data, family = poisson(link = "log"), std.err = "san.se")
+  
+
+rr <- exp(coef(result_rr))
+summary <- summary(result_rr)
+se <- summary$coefficients
+keisuu <- coef(result_rr)
+
+rr_table <- data.frame(
+  risk_ratio = rr,
+  CI_low = exp(keisuu - 1.96*(se$Std.err)),
+  CI_high = exp(keisuu + 1.96*(se$Std.err)),
+  pvalue = se$`Pr(>|W|)`
+)
+
+  coef_rr <- coef(result_rr)
+
+  se_rr <- sqrt(diag(vcov(result_rr)))
+  
+risk_ratio_measure <- exp(coef_rr["measure"])
+lower_ci <- exp(coef_rr["measure"] - 1.96 * se_rr["measure"])
+upper_ci <- exp(coef_rr["measure"] + 1.96 * se_rr["measure"])
+
+measure_values <- seq(0, mean(ac_data$measure) + (1.96*sd(ac_data$measure)), by = per)
+log_risk_ratios <- coef_rr["measure"] * measure_values
+risk_ratios <- exp(log_risk_ratios)
+lower_ci_values <- exp(log_risk_ratios - 1.96 * se_rr["measure"])  # 下限
+upper_ci_values <- exp(log_risk_ratios + 1.96 * se_rr["measure"])  # 上限
+
+d <- data.frame(measure = measure_values, 
+                         risk_ratio = risk_ratios, 
+                         lower_ci = lower_ci_values, 
+                         upper_ci = upper_ci_values)
+
+g <- ggplot() +
+  geom_ribbon(data = d, aes(x = measure, ymax = upper_ci, ymin = lower_ci), alpha = 0.2, fill = g_color) +
+  geom_line(data = d, aes(x = measure, y = risk_ratio), colour = g_color, linewidth = 2) +
+  geom_hline(yintercept = 1, col = "black", linetype = "longdash") +
+  theme(panel.border = element_rect(fill = NA, size = 1.0)) + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank()) +
+  theme(axis.text.y = element_text(size = 16), axis.title.y = element_blank(),
+        axis.text.x = element_text(size = 16), axis.title.x = element_blank(),
+        legend.text = element_text(size = 24), legend.title = element_text(size = 24),
+        legend.position = "none",
+        plot.subtitle = element_text(size = 24),
+        plot.title = element_text(face = "bold", size = 28)) +
+  scale_x_continuous(breaks=seq(0,width, length = cut_x), limits = c(0,width)) +
+  scale_y_continuous(breaks=sort(c(seq(0,height, length = cut_y), 1)), labels = function(y) ifelse(y == 1, "1", y), limits = c(0,(height)))　+
+  labs(subtitle = order)
+
+list(
+  season = .x,
+  acdata = ac_data,
+  result = result_rr,
+  rrtable = rr_table,
+  g = g,
+  d = d
+)
+
+}
+)
+totalresults_ac[[4]][["d"]]
+
+```
+
+```{r, echo=FALSE, include=FALSE}
+#tirtileの解析
+
+#ggeffect
+#全体
+#エアコン
+#crude
+cruderesults_ac_t <- map(season, ~ {
+    flg <- case_when(
+    grepl("春", .x) ~ "springflg",
+    grepl("夏", .x) ~ "summerflg",
+    grepl("秋", .x) ~ "fallflg",
+    grepl("冬", .x) ~ "winterflg")
+
+  ac_data <- figuredata %>% 
+    filter(app=="エアコン" & season==.x) %>% 
+    mutate(n = row_number()) %>% 
+    filter(.data[[flg]]==1) %>% 
+    mutate(measure = if_else(is.na(measure), 0, measure),
+           measure_t = case_when(measure<=as.numeric(quantile(measure, c(0.333, 0.666), na.rm = TRUE)[1]) ~ 1,
+                                  measure<=as.numeric(quantile(measure, c(0.333, 0.666), na.rm = TRUE)[2]) ~ 2,
+                                  measure>as.numeric(quantile(measure, c(0.333, 0.666), na.rm = TRUE)[2]) ~ 3),
+           measure_c = as.character(measure_t))
+
+  result_rr <- geeglm(frail ~ measure_c,
+                  id = n, data = ac_data, family = poisson(link = "log"), std.err = "san.se")
+  
+  result_rr_pft <- geeglm(frail ~ measure_t,
+                  id = n, data = ac_data, family = poisson(link = "log"), std.err = "san.se")
+
+rr <- exp(coef(result_rr))
+summary <- summary(result_rr)
+se <- summary$coefficients
+keisuu <- coef(result_rr)
+summary2 <- summary(result_rr_pft)
+pft <- summary2$coefficients[2,]
+
+rr_table <- data.frame(
+  risk_ratio = rr,
+  CI_low = exp(keisuu - 1.96*(se$Std.err)),
+  CI_high = exp(keisuu + 1.96*(se$Std.err)),
+  pvalue = se$`Pr(>|W|)`) %>% 
+  mutate(p_for_trend = pft$`Pr(>|W|)`)
+
+list(
+  season = .x,
+  acdata = ac_data,
+  result = result_rr,
+  rrtable = rr_table
+)
+
+}
+)
+
+#adjust
+totalresults_ac_t <- map(season, ~ {
+  flg <- case_when(
+    grepl("春", .x) ~ "springflg",
+    grepl("夏", .x) ~ "summerflg",
+    grepl("秋", .x) ~ "fallflg",
+    grepl("冬", .x) ~ "winterflg")
+  g_color <- case_when(
+    grepl("春", .x) ~ "hotpink",
+    grepl("夏", .x) ~ "dodgerblue",
+    grepl("秋", .x) ~ "orangered",
+    grepl("冬", .x) ~ "blue")
+  per <- case_when(
+    grepl("春", .x) ~ 18,
+    grepl("夏", .x) ~ 6,
+    grepl("秋", .x) ~ 6,
+    grepl("冬", .x) ~ 6)
+  order <- case_when(
+    grepl("春", .x) ~ "e)",
+    grepl("夏", .x) ~ "f)",
+    grepl("秋", .x) ~ "g)",
+    grepl("冬", .x) ~ "h)")
+
+  ac_data <- figuredata %>% 
+    filter(app=="エアコン" & season==.x) %>% 
+    mutate(n = row_number()) %>% 
+    filter(.data[[flg]]==1) %>% 
+    mutate(measure = if_else(is.na(measure), 0, measure),
+           tertile1 = as.numeric(quantile(measure, c(0.333, 0.666), na.rm = TRUE)[1]),
+           tertile2 = as.numeric(quantile(measure, c(0.333, 0.666), na.rm = TRUE)[2]),
+           measure_t = case_when(measure<=as.numeric(quantile(measure, c(0.333, 0.666), na.rm = TRUE)[1]) ~ 1,
+                                  measure<=as.numeric(quantile(measure, c(0.333, 0.666), na.rm = TRUE)[2]) ~ 2,
+                                  measure>as.numeric(quantile(measure, c(0.333, 0.666), na.rm = TRUE)[2]) ~ 3),
+           measure_c = as.character(measure_t))
+  
+  result_rr <- geeglm(frail ~ measure_c + 年齢 + 性別 + 教育年数 + GDS15_5以上 + city,
+                  id = n, data = ac_data, family = poisson(link = "log"), std.err = "san.se")
+  result_rr_pft <- geeglm(frail ~ measure_t + 年齢 + 性別 + 教育年数 + GDS15_5以上 + city,
+                  id = n, data = ac_data, family = poisson(link = "log"), std.err = "san.se")
+
+rr <- exp(coef(result_rr))
+summary <- summary(result_rr)
+se <- summary$coefficients
+keisuu <- coef(result_rr)
+summary2 <- summary(result_rr_pft)
+pft <- summary2$coefficients[2,]
+
+rr_table <- data.frame(
+  risk_ratio = rr,
+  CI_low = exp(keisuu - 1.96*(se$Std.err)),
+  CI_high = exp(keisuu + 1.96*(se$Std.err)),
+  pvalue = se$`Pr(>|W|)`) %>% 
+  mutate(p_for_trend = pft$`Pr(>|W|)`)
+
+graphdata <- bind_rows(rr_table[1,] %>% mutate(risk_ratio = 1, CI_low = 1, CI_high = 1, pvalue = NA, p_for_trend = NA), rr_table[2:3, ]) %>% 
+  mutate(tertile = c("1", "2", "3"))
+rownames(graphdata) <- c("1", "2", "3")
+
+g <- ggplot() +
+  geom_errorbar(data = graphdata, aes(x = tertile, ymax = CI_high, ymin = CI_low), width = 0.3, colour = g_color) +
+  geom_point(data = graphdata, aes(x = tertile, y = risk_ratio), size = 5, colour = g_color) +
+  geom_hline(yintercept = 1, col = "black", linetype = "longdash") +
+  theme(panel.border = element_rect(fill = NA, size = 1.0)) + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank()) +
+  theme(axis.text.y = element_text(size = 16), axis.title.y = element_blank(),
+        axis.text.x = element_text(size = 16), axis.title.x = element_blank(),
+        legend.text = element_text(size = 24), legend.title = element_text(size = 24),
+        legend.position = "none",
+        plot.subtitle = element_text(size = 24),
+        plot.title = element_text(face = "bold", size = 28)) + 
+  labs(subtitle = order) +
+  scale_y_continuous(breaks=sort(c(seq(0,per, length = 4), 1)), 
+                     labels = function(y) ifelse(y == 1, "1", y), 
+                     limits = c(0,(per+0.5))) +
+  coord_fixed(ratio= 6/per)
+
+list(
+  season = .x,
+  acdata = ac_data,
+  result = result_rr,
+  rrtable = rr_table,
+  g = g
+)
+
+}
+)
+```
+
+```{r, echo=FALSE, include=FALSE}
+#Generalized Additive modelの解析
+library(parameters)
+
+adjustresults_ac_gam <- map(season, ~ {
+    flg <- case_when(
+    grepl("春", .x) ~ "springflg",
+    grepl("夏", .x) ~ "summerflg",
+    grepl("秋", .x) ~ "fallflg",
+    grepl("冬", .x) ~ "winterflg")
+
+  ac_data <- figuredata %>% 
+    filter(app=="エアコン" & season==.x) %>% 
+    mutate(n = row_number()) %>% 
+    filter(.data[[flg]]==1) %>% 
+    mutate(measure = if_else(is.na(measure), 0, measure))
+  
+    result_rr <- gam(frail ~ measure + 年齢 + 性別 + 教育年数 + GDS15_5以上 + city, data = ac_data, family = poisson(link = "log"))
+    
+    c1 <- names(which.max(summary(factor(ac_data$性別))))
+    c2 <- names(sort(table(ac_data$GDS15_5以上), decreasing = TRUE))[1]
+    c3 <- names(sort(table(ac_data$city), decreasing = TRUE))[1]
+    
+    new_data <- data.frame(
+      measure = seq(min(ac_data$measure), mean(ac_data$measure) + (1.96*sd(ac_data$measure)), length.out = 100),
+      年齢 = mean(ac_data$年齢),
+      性別 = "男",
+      教育年数 = mean(ac_data$教育年数),
+      GDS15_5以上 = "0",
+      city = "CityB")
+                
+    pred <- predict(result_rr, newdata = new_data, se.fit = TRUE)
+    
+    
+    new_data$fit <- pred$fit
+    new_data$lwr <- pred$fit - 1.96 * pred$se.fit
+    new_data$upr <- pred$fit + 1.96 * pred$se.fit
+    
+    g <- ggplot(new_data, aes(x = measure, y = fit)) +
+      geom_line(color = "blue", size = 1) + 
+      geom_ribbon(aes(ymin = lwr, ymax = upr), fill = "blue", alpha = 0.2) + 
+      labs(title = "GAM Model Fit with Confidence Interval",
+           x = "usage time", y = "Predicted frailty") +
+      theme_minimal()
+
+    rr <- exp(coef(result_rr))
+    summary <- summary(result_rr)
+    rrtable <- model_parameters(result_rr, ci = 0.95, exponentiate = TRUE) %>% 
+      filter(Parameter=="measure") %>% 
+      select(risk_ratio = Coefficient, CI_low, CI_high, p)
+
+list(
+  season = .x,
+  acdata = ac_data,
+  summary = summary,
+  result = result_rr,
+  rrtable = rrtable,
+  graph = g,
+  plot = plot
+)
+
+}
+)
+
+```
+
+
+```{r, echo=FALSE, include=FALSE}
+season <- c("春", "夏", "秋", "冬")
+
+#ggeffect
+#全体
+#電子レンジ
+#crude
+
+  analysidata <- figuredata %>% 
+    filter(app=="レンジ" & season=="年") %>% 
+    mutate(n = row_number()) %>% 
+    mutate(measure = if_else(is.na(measure), 0, measure))
+  
+  result_rr <- geeglm(frail ~ measure,
+                  id = n, data = analysidata, family = poisson(link = "log"), std.err = "san.se")
+
+rr <- exp(coef(result_rr))
+summary <- summary(result_rr)
+se <- summary$coefficients
+keisuu <- coef(result_rr)
+
+rr_table <- data.frame(
+  risk_ratio_crude = rr,
+  CI_low_crude = exp(keisuu - 1.96*(se$Std.err)),
+  CI_high_crude = exp(keisuu + 1.96*(se$Std.err)),
+  pvalue_crude = se$`Pr(>|W|)`
+) %>% 
+  mutate(n = row_number())
+
+result_rr <- geeglm(frail ~ measure + 年齢 + 性別 + 教育年数 + GDS15_5以上 + city,
+                  id = n, data = analysidata, family = poisson(link = "log"), std.err = "san.se")
+
+rr <- exp(coef(result_rr))
+summary <- summary(result_rr)
+se <- summary$coefficients
+keisuu <- coef(result_rr)
+
+rr_table_mo <- left_join(rr_table, data.frame(
+  risk_ratio_adjust = rr,
+  CI_low_adjust = exp(keisuu - 1.96*(se$Std.err)),
+  CI_high_adjust = exp(keisuu + 1.96*(se$Std.err)),
+  pvalue_adjust = se$`Pr(>|W|)`
+) %>% 
+  mutate(n = row_number()),
+by="n") %>% 
+  filter(n==2) %>% 
+  select(-c(n))
+
+mylist1 <- list(measure = seq(0, mean(analysidata$measure) + (1.96*sd(analysidata$measure)), by = 0.1))
+d <- data.frame(emmeans(result_rr, "measure", at = mylist1, type = "response"))
+
+g_mo <- ggplot() +
+  geom_ribbon(data = d, aes(x = measure, ymax = upper.CL, ymin = lower.CL), alpha = 0.2, fill = "black") +
+  geom_line(data = d, aes(x = measure, y = rate), colour = "black", linewidth = 2) +
+  theme(panel.border = element_rect(fill = NA, size = 1.0)) + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank()) +
+  theme(axis.text.y = element_text(size = 16), axis.title.y = element_text(size = 12),
+        axis.text.x = element_text(size = 16), axis.title.x = element_text(size = 20),
+        legend.text = element_text(size = 24), legend.title = element_text(size = 24),
+        legend.position = "none",
+        plot.subtitle = element_text(size = 24),
+        plot.title = element_text(face = "bold", size = 28)) +
+  scale_x_continuous(breaks=seq(0,0.3, length = 4), limits = c(0,0.32)) +
+  scale_y_continuous(breaks=seq(0,1, length = 6), limits = c(0,1)) +
+  labs(title = "One year", subtitle = "m)") +
+  ylab("") + xlab("Usage time(hours/day) of microwave oven")
+```
+
+```{r, echo=FALSE, include=FALSE}
+season <- c("春", "夏", "秋", "冬")
+
+#ggeffect
+#全体
+#洗濯機
+#crude
+  analysidata <- figuredata %>% 
+    filter(app=="洗濯機" & season=="年") %>% 
+    mutate(n = row_number()) %>% 
+    mutate(measure = if_else(is.na(measure), 0, measure))
+
+  result_rr <- geeglm(frail ~ measure,
+                  id = n, data = analysidata, family = poisson(link = "log"), std.err = "san.se")
+
+rr <- exp(coef(result_rr))
+summary <- summary(result_rr)
+se <- summary$coefficients
+keisuu <- coef(result_rr)
+
+rr_table <- data.frame(
+  risk_ratio_crude = rr,
+  CI_low_crude = exp(keisuu - 1.96*(se$Std.err)),
+  CI_high_crude = exp(keisuu + 1.96*(se$Std.err)),
+  pvalue_crude = se$`Pr(>|W|)`
+) %>% 
+  mutate(n = row_number())
+
+result_rr <- geeglm(frail ~ measure + 年齢 + 性別 + 教育年数 + GDS15_5以上 + city,
+                  id = n, data = analysidata, family = poisson(link = "log"), std.err = "san.se")
+
+rr <- exp(coef(result_rr))
+summary <- summary(result_rr)
+se <- summary$coefficients
+keisuu <- coef(result_rr)
+
+rr_table_wm <- left_join(rr_table, data.frame(
+  risk_ratio_adjust = rr,
+  CI_low_adjust = exp(keisuu - 1.96*(se$Std.err)),
+  CI_high_adjust = exp(keisuu + 1.96*(se$Std.err)),
+  pvalue_adjust = se$`Pr(>|W|)`
+) %>% 
+  mutate(n = row_number()),
+by="n") %>% 
+  filter(n==2) %>% 
+  select(-c(n))
+
+
+```
+
+```{r, echo=FALSE, include=FALSE}
+season <- c("春", "夏", "秋", "冬")
+
+#ggeffect
+#全体
+#炊飯器
+#crude
+
+  analysidata <- figuredata %>% 
+    filter(app=="炊飯器" & season=="年") %>% 
+    mutate(n = row_number()) %>% 
+    mutate(measure = if_else(is.na(measure), 0, measure))
+
+  result_rr <- geeglm(frail ~ measure,
+                  id = n, data = analysidata, family = poisson(link = "log"), std.err = "san.se")
+
+rr <- exp(coef(result_rr))
+summary <- summary(result_rr)
+se <- summary$coefficients
+keisuu <- coef(result_rr)
+
+rr_table <- data.frame(
+  risk_ratio_crude = rr,
+  CI_low_crude = exp(keisuu - 1.96*(se$Std.err)),
+  CI_high_crude = exp(keisuu + 1.96*(se$Std.err)),
+  pvalue_crude = se$`Pr(>|W|)`
+) %>% 
+  mutate(n = row_number())
+
+result_rr <- geeglm(frail ~ measure + 年齢 + 性別 + 教育年数 + GDS15_5以上 + city,
+                  id = n, data = analysidata, family = poisson(link = "log"), std.err = "san.se")
+
+rr <- exp(coef(result_rr))
+summary <- summary(result_rr)
+se <- summary$coefficients
+keisuu <- coef(result_rr)
+
+rr_table_rc <- left_join(rr_table, data.frame(
+  risk_ratio_adjust = rr,
+  CI_low_adjust = exp(keisuu - 1.96*(se$Std.err)),
+  CI_high_adjust = exp(keisuu + 1.96*(se$Std.err)),
+  pvalue_adjust = se$`Pr(>|W|)`
+) %>% 
+  mutate(n = row_number()),
+by="n") %>% 
+  filter(n==2) %>% 
+  select(-c(n))
+
+mylist1 <- list(measure = seq(0, mean(analysidata$measure) + (1.96*sd(analysidata$measure)), by = 0.1))
+d <- data.frame(emmeans(result_rr, "measure", at = mylist1, type = "response"))
+
+g_rc <- ggplot() +
+  geom_ribbon(data = d, aes(x = measure, ymax = upper.CL, ymin = lower.CL), alpha = 0.2, fill = "black") +
+  geom_line(data = d, aes(x = measure, y = rate), colour = "black", linewidth = 2) +
+  theme(panel.border = element_rect(fill = NA, size = 1.0)) + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank()) +
+  theme(axis.text.y = element_text(size = 16), axis.title.y = element_text(size = 12),
+        axis.text.x = element_text(size = 16), axis.title.x = element_text(size = 20),
+        legend.text = element_text(size = 24), legend.title = element_text(size = 24),
+        legend.position = "none",
+        plot.subtitle = element_text(size = 24),
+        plot.title = element_text(face = "bold", size = 28)) +
+  scale_x_continuous(breaks=seq(0,0.1, length = 5), limits = c(0,0.1)) +
+  scale_y_continuous(breaks=seq(0,1, length = 6), limits = c(0,1)) +
+  labs(title = "One year", subtitle = "n)") +
+  ylab("") + xlab("Usage time(hours/day) of rice cooker")
+```
+
+```{r, echo=FALSE, include=FALSE}
+
+rr_table_ac <- bind_rows(cruderesults_ac[[1]][["rrtable"]] %>% filter(rownames(.)=="measure"),
+                         cruderesults_ac[[2]][["rrtable"]] %>% filter(rownames(.)=="measure"),
+                         cruderesults_ac[[3]][["rrtable"]] %>% filter(rownames(.)=="measure"),
+                         cruderesults_ac[[4]][["rrtable"]] %>% filter(rownames(.)=="measure")) %>% 
+  mutate(across(c(risk_ratio:pvalue), ~ floor(.x*1000)/1000)) %>% 
+  rename_with( ~ str_c(.x, "_crude")) %>% 
+  bind_cols(bind_rows(totalresults_ac[[1]][["rrtable"]] %>% filter(rownames(.)=="measure"),
+                      totalresults_ac[[2]][["rrtable"]] %>% filter(rownames(.)=="measure"),
+                      totalresults_ac[[3]][["rrtable"]] %>% filter(rownames(.)=="measure"),
+                      totalresults_ac[[4]][["rrtable"]] %>% filter(rownames(.)=="measure")) %>% 
+              mutate(across(c(risk_ratio:pvalue), ~ floor(.x*1000)/1000)) %>% 
+              rename_with( ~ str_c(.x, "_adjust")))
+  
+row.names(rr_table_ac) <- c("エアコン_全体_春", "エアコン_全体_夏", "エアコン_全体_秋", "エアコン_全体_冬")
+
+rr_table_ac_t <- bind_rows(cruderesults_ac_t[[1]][["rrtable"]],
+                         cruderesults_ac_t[[2]][["rrtable"]],
+                         cruderesults_ac_t[[3]][["rrtable"]],
+                         cruderesults_ac_t[[4]][["rrtable"]]) %>% 
+  mutate(across(c(risk_ratio:pvalue), ~ floor(.x*1000)/1000)) %>% 
+  rename_with( ~ str_c(.x, "_crude")) %>% 
+  bind_cols(bind_rows(totalresults_ac_t[[1]][["rrtable"]][1:3, ],
+                      totalresults_ac_t[[2]][["rrtable"]][1:3, ],
+                      totalresults_ac_t[[3]][["rrtable"]][1:3, ],
+                      totalresults_ac_t[[4]][["rrtable"]][1:3, ]) %>% 
+              mutate(across(c(risk_ratio:pvalue), ~ floor(.x*1000)/1000)) %>% 
+              rename_with( ~ str_c(.x, "_adjust")))
+```
+
+```{r, echo=FALSE,}
+add_global_label <- function(pwobj, Xlab = NULL, Ylab = NULL, Xgap = 0.03, Ygap = 0.03, ...) {
+    ylabgrob <- patchwork::plot_spacer()
+    if (!is.null(Ylab)) {
+        ylabgrob <- ggplot() +
+            geom_text(aes(x = .5, y = .5), label = Ylab, angle = 90, ...) +
+            theme_void()
+    }
+    if (!is.null(Xlab)) {
+        xlabgrob <- ggplot() +
+            geom_text(aes(x = .5, y = .5), label = Xlab, ...) +
+            theme_void()
+    }
+    if (!is.null(Ylab) & is.null(Xlab)) {
+        return((ylabgrob + patchworkGrob(pwobj)) + 
+            patchwork::plot_layout(widths = 100 * c(Ygap, 1 - Ygap)))
+    }
+    if (is.null(Ylab) & !is.null(Xlab)) {
+        return((ylabgrob + pwobj) + 
+            (xlabgrob) +
+            patchwork::plot_layout(heights = 100 * c(1 - Xgap, Xgap),
+                                   widths = c(0, 100),
+                                   design = "
+                                   AB
+                                   CC
+                                   "
+            ))
+    }
+    if (!is.null(Ylab) & !is.null(Xlab)) {
+        return((ylabgrob + pwobj) + 
+            (xlabgrob) +
+            patchwork::plot_layout(heights = 100 * c(1 - Xgap, Xgap),
+                                   widths = 100 * c(Ygap, 1 - Ygap),
+                                   design = "
+                                   AB
+                                   CC
+                                   "
+            ))
+    }
+    return(pwobj)
+}
+```
+
+## 図表
+
+```{r, echo=FALSE,}
+g <- (totalresults_ac[[1]][["g"]] | totalresults_ac[[2]][["g"]] | totalresults_ac[[3]][["g"]] | totalresults_ac[[4]][["g"]])
+
+g2 <- (totalresults_ac_t[[1]][["g"]] | totalresults_ac_t[[2]][["g"]] | totalresults_ac_t[[3]][["g"]] | totalresults_ac_t[[4]][["g"]])
+
+g3 <- (adjustresults_ac_gam[[1]][["graph"]]) | (adjustresults_ac_gam[[2]][["graph"]]) | 
+  (adjustresults_ac_gam[[3]][["graph"]]) | (adjustresults_ac_gam[[4]][["graph"]])
+g
+g2
+g3
+```
+## TV　全体　解析結果　
+
+```{r, echo=FALSE,}
+rr_table_tv %>% gt() %>% gt_highlight_cols(columns = risk_ratio_adjust:pvalue_adjust, fill = "azure2")
+```
+
+## エアコン　全体　解析結果　
+
+```{r, echo=FALSE,}
+rr_table_ac %>% gt() %>% gt_highlight_cols(columns = risk_ratio_adjust:pvalue_adjust, fill = "azure2")
+```
+
+## レンジ　全体　解析結果　
+
+```{r, echo=FALSE,}
+rr_table_mo %>% gt() %>% gt_highlight_cols(columns = risk_ratio_adjust:pvalue_adjust, fill = "azure2")
+```
+
+## 洗濯機　全体　解析結果　
+
+```{r, echo=FALSE,}
+rr_table_wm %>% gt() %>% gt_highlight_cols(columns = risk_ratio_adjust:pvalue_adjust, fill = "azure2")
+```
+
+## 炊飯器　全体　解析結果　
+
+```{r, echo=FALSE,}
+rr_table_rc %>% gt() %>% gt_highlight_cols(columns = risk_ratio_adjust:pvalue_adjust, fill = "azure2")
+```
+
